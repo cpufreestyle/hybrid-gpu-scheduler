@@ -14,6 +14,7 @@ import (
 	"github.com/hybrid-gpu-scheduler/internal/gpumonitor"
 	"github.com/hybrid-gpu-scheduler/internal/metrics"
 	"github.com/hybrid-gpu-scheduler/internal/scheduler"
+	"github.com/hybrid-gpu-scheduler/pkg/gpu-devices"
 	"github.com/hybrid-gpu-scheduler/pkg/llmscheduler"
 	"github.com/hybrid-gpu-scheduler/pkg/types"
 	"github.com/hybrid-gpu-scheduler/pkg/vram"
@@ -28,6 +29,11 @@ func main() {
 	log.Println("Unified NVIDIA + AMD GPU Scheduler v3.0 (Training + LLM Inference)")
 
 	sched := scheduler.NewScheduler()
+
+	// 发现真实 GPU，替换默认的模拟数据
+	log.Println("[main] Discovering real GPUs...")
+	DiscoverAndRegisterRealGPUs(sched)
+
 	execInst := executor.GetExecutor()
 
 	execInst.SetSSELogger(websocket.NewLogBridge())
@@ -649,4 +655,62 @@ func getPolicyDescription(policy types.SchedulingPolicy) string {
 	default:
 		return "Unknown policy"
 	}
+}
+
+// DiscoverAndRegisterRealGPUs discovers real GPUs via nvidia-smi / rocm-smi
+// and registers them with the scheduler (replacing default simulated ones).
+func DiscoverAndRegisterRealGPUs(sched *scheduler.Scheduler) {
+	mgr := gpudevices.GetGPUDeviceManager()
+	err := mgr.Refresh()
+	if err != nil {
+		log.Printf("[main] Warning: could not discover real GPUs: %v", err)
+		log.Println("[main] Falling back to default (simulated) GPU configuration")
+		return
+	}
+
+	gpus, err := mgr.GetAllGPUs()
+	if err != nil {
+		log.Printf("[main] Warning: failed to get GPU info: %v", err)
+		log.Println("[main] Falling back to default (simulated) GPU configuration")
+		return
+	}
+
+	if len(gpus) == 0 {
+		log.Println("[main] Warning: no GPUs discovered, keeping default configuration")
+		return
+	}
+
+	// 用真实 GPU 替换默认的模拟 GPU
+	for _, g := range gpus {
+		gpuType := types.GPUTypeNVIDIA
+		if g.Vendor == "AMD" {
+			gpuType = types.GPUTypeAMD
+		}
+
+		snap := &types.GPUSnapshot{
+			Info: types.GPUInfo{
+				ID:           strconv.Itoa(g.Index),
+				Type:         gpuType,
+				Name:         g.Name,
+				VRAMMB:       int(g.MemoryTotal), // MB
+				CoreCount:    0, //  unknown from smi
+				ComputeUnits: 0, //  unknown from smi
+				Architecture: "", //  unknown from smi
+			},
+			Usage: types.GPUUsage{
+				ID:           strconv.Itoa(g.Index),
+				UsedVRAMMB:   int(g.MemoryUsed),
+				Utilization:  g.Utilization,
+				MemoryUtil:   float64(g.MemoryUsed) * 100.0 / float64(g.MemoryTotal),
+				ComputeUtil:  g.Utilization,
+				RunningTasks: 0,
+				LastUpdated:  time.Now(),
+			},
+		}
+
+		sched.RegisterGPU(snap)
+		log.Printf("[main] Registered real GPU: %s (%s, %d MB VRAM)", strconv.Itoa(g.Index), g.Name, g.MemoryTotal)
+	}
+
+	log.Printf("[main] Total real GPUs registered: %d", len(gpus))
 }
